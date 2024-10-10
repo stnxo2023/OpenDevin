@@ -72,3 +72,15 @@ class LLMResponseError(Exception):
 class UserCancelledError(Exception):
     def __init__(self, message='User cancelled the request'):
         super().__init__(message)
+
+
+class MicroAgentValidationError(Exception):
+    def __init__(self, message='Micro agent validation failed'):
+        super().__init__(message)
+
+
+class OperationCancelled(Exception):
+    """Exception raised when an operation is cancelled (e.g. by a keyboard interrupt)."""
+
+    def __init__(self, message='Operation was cancelled'):
+        super().__init__(message)

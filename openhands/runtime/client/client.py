@@ -7,19 +7,24 @@ NOTE: this will be executed inside the docker sandbox.
 
 import argparse
 import asyncio
+import io
 import os
 import re
 import shutil
 import subprocess
+import tempfile
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from zipfile import ZipFile
 
 import pexpect
-from fastapi import FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
-from pathspec import PathSpec
-from pathspec.patterns import GitWildMatchPattern
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from uvicorn import run
 
 from openhands.core.logger import openhands_logger as logger
@@ -58,10 +63,18 @@ class ActionRequest(BaseModel):
 
 ROOT_GID = 0
 INIT_COMMANDS = [
-    'git config --global user.name "openhands"',
-    'git config --global user.email "openhands@all-hands.dev"',
-    "alias git='git --no-pager'",
+    'git config --global user.name "openhands" && git config --global user.email "openhands@all-hands.dev" && alias git="git --no-pager"',
 ]
+SOFT_TIMEOUT_SECONDS = 5
+
+SESSION_API_KEY = os.environ.get('SESSION_API_KEY')
+api_key_header = APIKeyHeader(name='X-Session-API-Key', auto_error=False)
+
+
+def verify_api_key(api_key: str = Depends(api_key_header)):
+    if SESSION_API_KEY and api_key != SESSION_API_KEY:
+        raise HTTPException(status_code=403, detail='Invalid API Key')
+    return api_key
 
 
 class RuntimeClient:
@@ -87,7 +100,8 @@ class RuntimeClient:
         self.lock = asyncio.Lock()
         self.plugins: dict[str, Plugin] = {}
         self.browser = BrowserEnv(browsergym_eval_env)
-        self._initial_pwd = work_dir
+        self.start_time = time.time()
+        self.last_execution_time = self.start_time
 
     @property
     def initial_pwd(self):
@@ -116,22 +130,76 @@ class RuntimeClient:
             logger.info(f'AgentSkills initialized: {obs}')
 
         await self._init_bash_commands()
+        logger.info('Runtime client initialized.')
 
     def _init_user(self, username: str, user_id: int) -> None:
-        """Create user if not exists."""
+        """Create working directory and user if not exists.
+        It performs the following steps effectively:
+        * Creates the Working Directory:
+            - Uses mkdir -p to create the directory.
+            - Sets ownership to username:root.
+            - Adjusts permissions to be readable and writable by group and others.
+        * User Verification and Creation:
+            - Checks if the user exists using id -u.
+            - If the user exists with the correct UID, it skips creation.
+            - If the UID differs, it logs a warning and updates self.user_id.
+            - If the user doesn't exist, it proceeds to create the user.
+        * Sudo Configuration:
+            - Appends %sudo ALL=(ALL) NOPASSWD:ALL to /etc/sudoers to grant
+              passwordless sudo access to the sudo group.
+            - Adds the user to the sudo group with the useradd command, handling
+              UID conflicts by incrementing the UID if necessary.
+        """
+
+        # First create the working directory, independent of the user
+        logger.info(f'Client working directory: {self.initial_pwd}')
+        command = f'umask 002; mkdir -p {self.initial_pwd}'
+        output = subprocess.run(command, shell=True, capture_output=True)
+        out_str = output.stdout.decode()
+
+        command = f'chown -R {username}:root {self.initial_pwd}'
+        output = subprocess.run(command, shell=True, capture_output=True)
+        out_str += output.stdout.decode()
+
+        command = f'chmod g+rw {self.initial_pwd}'
+        output = subprocess.run(command, shell=True, capture_output=True)
+        out_str += output.stdout.decode()
+        logger.debug(f'Created working directory. Output: [{out_str}]')
+
         # Skip root since it is already created
         if username == 'root':
             return
 
         # Check if the username already exists
+        existing_user_id = -1
         try:
-            subprocess.run(
+            result = subprocess.run(
                 f'id -u {username}', shell=True, check=True, capture_output=True
             )
-            logger.debug(f'User {username} already exists. Skipping creation.')
+            existing_user_id = int(result.stdout.decode().strip())
+
+            # The user ID already exists, skip setup
+            if existing_user_id == user_id:
+                logger.debug(
+                    f'User `{username}` already has the provided UID {user_id}. Skipping user setup.'
+                )
+            else:
+                logger.warning(
+                    f'User `{username}` already exists with UID {existing_user_id}. Skipping user setup.'
+                )
+                self.user_id = existing_user_id
             return
-        except subprocess.CalledProcessError:
-            pass  # User does not exist, continue with creation
+        except subprocess.CalledProcessError as e:
+            # Returncode 1 indicates, that the user does not exist yet
+            if e.returncode == 1:
+                logger.debug(
+                    f'User `{username}` does not exist. Proceeding with user creation.'
+                )
+            else:
+                logger.error(
+                    f'Error checking user `{username}`, skipping setup:\n{e}\n'
+                )
+                raise
 
         # Add sudoer
         sudoer_line = r"echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers"
@@ -140,33 +208,19 @@ class RuntimeClient:
             raise RuntimeError(f'Failed to add sudoer: {output.stderr.decode()}')
         logger.debug(f'Added sudoer successfully. Output: [{output.stdout.decode()}]')
 
-        # Attempt to add the user, retrying with incremented user_id if necessary
-        while True:
-            command = (
-                f'useradd -rm -d /home/{username} -s /bin/bash '
-                f'-g root -G sudo -u {user_id} {username}'
+        command = (
+            f'useradd -rm -d /home/{username} -s /bin/bash '
+            f'-g root -G sudo -u {user_id} {username}'
+        )
+        output = subprocess.run(command, shell=True, capture_output=True)
+        if output.returncode == 0:
+            logger.debug(
+                f'Added user `{username}` successfully with UID {user_id}. Output: [{output.stdout.decode()}]'
             )
-
-            if not os.path.exists(self.initial_pwd):
-                command += f' && mkdir -p {self.initial_pwd}'
-                command += f' && chown -R {username}:root {self.initial_pwd}'
-                command += f' && chmod g+s {self.initial_pwd}'
-
-            output = subprocess.run(command, shell=True, capture_output=True)
-            if output.returncode == 0:
-                logger.debug(
-                    f'Added user {username} successfully with UID {user_id}. Output: [{output.stdout.decode()}]'
-                )
-                break
-            elif f'UID {user_id} is not unique' in output.stderr.decode():
-                logger.warning(
-                    f'UID {user_id} is not unique. Incrementing UID and retrying...'
-                )
-                user_id += 1
-            else:
-                raise RuntimeError(
-                    f'Failed to create user {username}: {output.stderr.decode()}'
-                )
+        else:
+            raise RuntimeError(
+                f'Failed to create user `{username}` with UID {user_id}. Output: [{output.stderr.decode()}]'
+            )
 
     def _init_bash_shell(self, work_dir: str, username: str) -> None:
         self.shell = pexpect.spawn(
@@ -174,21 +228,29 @@ class RuntimeClient:
             encoding='utf-8',
             echo=False,
         )
-        self.__bash_PS1 = r'[PEXPECT_BEGIN] \u@\h:\w [PEXPECT_END]'
+        self.__bash_PS1 = (
+            r'[PEXPECT_BEGIN]\n'
+            r'$(which python >/dev/null 2>&1 && echo "[Python Interpreter: $(which python)]\n")'
+            r'\u@\h:\w\n'
+            r'[PEXPECT_END]'
+        )
 
         # This should NOT match "PS1=\u@\h:\w [PEXPECT]$" when `env` is executed
-        self.__bash_expect_regex = (
-            r'\[PEXPECT_BEGIN\] ([a-z0-9_-]*)@([a-zA-Z0-9.-]*):(.+) \[PEXPECT_END\]'
-        )
-
-        self.shell.sendline(f'export PS1="{self.__bash_PS1}"; export PS2=""')
+        self.__bash_expect_regex = r'\[PEXPECT_BEGIN\]\s*(.*?)\s*([a-z0-9_-]*)@([a-zA-Z0-9.-]*):(.+)\s*\[PEXPECT_END\]'
+        # Set umask to allow group write permissions
+        self.shell.sendline(f'umask 002; export PS1="{self.__bash_PS1}"; export PS2=""')
         self.shell.expect(self.__bash_expect_regex)
 
-        self.shell.sendline(f'cd {work_dir}')
+        self.shell.sendline(
+            f'if [ ! -d "{work_dir}" ]; then mkdir -p "{work_dir}"; fi && cd "{work_dir}"'
+        )
         self.shell.expect(self.__bash_expect_regex)
         logger.debug(
-            f'Bash initialized. Working directory: {work_dir}. Output: {self.shell.before}'
+            f'Bash initialized. Working directory: {work_dir}. Output: [{self.shell.before}]'
         )
+        # Ensure the group has write permissions on the working directory
+        self.shell.sendline(f'chmod g+rw "{work_dir}"')
+        self.shell.expect(self.__bash_expect_regex)
 
     async def _init_bash_commands(self):
         logger.info(f'Initializing by running {len(INIT_COMMANDS)} bash commands...')
@@ -206,8 +268,14 @@ class RuntimeClient:
 
     def _get_bash_prompt_and_update_pwd(self):
         ps1 = self.shell.after
+        if ps1 == pexpect.EOF:
+            logger.error(f'Bash shell EOF! {self.shell.after=}, {self.shell.before=}')
+            raise RuntimeError('Bash shell EOF')
+        if ps1 == pexpect.TIMEOUT:
+            logger.warning('Bash shell timeout')
+            return ''
 
-        # begin at the last occurence of '[PEXPECT_BEGIN]'.
+        # begin at the last occurrence of '[PEXPECT_BEGIN]'.
         # In multi-line bash commands, the prompt will be repeated
         # and the matched regex captures all of them
         # - we only want the last one (newest prompt)
@@ -220,11 +288,12 @@ class RuntimeClient:
         assert (
             matched is not None
         ), f'Failed to parse bash prompt: {ps1}. This should not happen.'
-        username, hostname, working_dir = matched.groups()
+        other_info, username, hostname, working_dir = matched.groups()
+        working_dir = working_dir.rstrip()
         self.pwd = os.path.expanduser(working_dir)
 
         # re-assemble the prompt
-        prompt = f'{username}@{hostname}:{working_dir} '
+        prompt = f'{other_info.strip()}\n{username}@{hostname}:{working_dir} '
         if username == 'root':
             prompt += '#'
         else:
@@ -234,46 +303,124 @@ class RuntimeClient:
     def _execute_bash(
         self,
         command: str,
-        timeout: int | None,
+        timeout: int,
         keep_prompt: bool = True,
+        kill_on_timeout: bool = True,
     ) -> tuple[str, int]:
         logger.debug(f'Executing command: {command}')
+        self.shell.sendline(command)
+        return self._continue_bash(
+            timeout=timeout, keep_prompt=keep_prompt, kill_on_timeout=kill_on_timeout
+        )
+
+    def _interrupt_bash(
+        self,
+        action_timeout: int | None,
+        interrupt_timeout: int | None = None,
+        max_retries: int = 2,
+    ) -> tuple[str, int]:
+        self.shell.sendintr()  # send SIGINT to the shell
+        logger.debug('Sent SIGINT to bash. Waiting for output...')
+
+        interrupt_timeout = interrupt_timeout or 1  # default timeout for SIGINT
+        # try to interrupt the bash shell use SIGINT
+        while max_retries > 0:
+            try:
+                self.shell.expect(self.__bash_expect_regex, timeout=interrupt_timeout)
+                output = self.shell.before
+                logger.debug(f'Received output after SIGINT: {output}')
+                exit_code = 130  # SIGINT
+
+                _additional_msg = ''
+                if action_timeout is not None:
+                    _additional_msg = (
+                        f'Command timed out after {action_timeout} seconds. '
+                    )
+                output += (
+                    '\r\n\r\n'
+                    + f'[{_additional_msg}SIGINT was sent to interrupt the command.]'
+                )
+                return output, exit_code
+            except pexpect.TIMEOUT as e:
+                logger.warning(f'Bash pexpect.TIMEOUT while waiting for SIGINT: {e}')
+                max_retries -= 1
+
+        # fall back to send control-z
+        logger.error(
+            'Failed to get output after SIGINT. Max retries reached. Sending control-z...'
+        )
+        self.shell.sendcontrol('z')
+        self.shell.expect(self.__bash_expect_regex)
+        output = self.shell.before
+        logger.debug(f'Received output after control-z: {output}')
+        # Try to kill the job
+        self.shell.sendline('kill -9 %1')
+        self.shell.expect(self.__bash_expect_regex)
+        logger.debug(f'Received output after killing job %1: {self.shell.before}')
+        output += self.shell.before
+
+        _additional_msg = ''
+        if action_timeout is not None:
+            _additional_msg = f'Command timed out after {action_timeout} seconds. '
+        output += (
+            '\r\n\r\n'
+            + f'[{_additional_msg}SIGINT was sent to interrupt the command, but failed. The command was killed.]'
+        )
+
+        # Try to get the exit code again
+        self.shell.sendline('echo $?')
+        self.shell.expect(self.__bash_expect_regex)
+        _exit_code_output = self.shell.before
+        exit_code = self._parse_exit_code(_exit_code_output)
+
+        return output, exit_code
+
+    def _parse_exit_code(self, output: str) -> int:
         try:
-            self.shell.sendline(command)
+            exit_code = int(output.strip().split()[0])
+        except Exception:
+            logger.error('Error getting exit code from bash script')
+            # If we try to run an invalid shell script the output sometimes includes error text
+            # rather than the error code - we assume this is an error
+            exit_code = 2
+        return exit_code
+
+    def _continue_bash(
+        self,
+        timeout: int,
+        keep_prompt: bool = True,
+        kill_on_timeout: bool = True,
+    ) -> tuple[str, int]:
+        logger.debug(f'Continuing bash with timeout={timeout}')
+        try:
             self.shell.expect(self.__bash_expect_regex, timeout=timeout)
 
             output = self.shell.before
 
             # Get exit code
             self.shell.sendline('echo $?')
-            logger.debug(f'Executing command for exit code: {command}')
+            logger.debug('Requesting exit code...')
             self.shell.expect(self.__bash_expect_regex, timeout=timeout)
             _exit_code_output = self.shell.before
-            logger.debug(f'Exit code Output: {_exit_code_output}')
-            exit_code = int(_exit_code_output.strip().split()[0])
-
+            exit_code = self._parse_exit_code(_exit_code_output)
         except pexpect.TIMEOUT as e:
-            self.shell.sendintr()  # send SIGINT to the shell
-            self.shell.expect(self.__bash_expect_regex, timeout=timeout)
-            output = self.shell.before
-            output += (
-                '\r\n\r\n'
-                + f'[Command timed out after {timeout} seconds. SIGINT was sent to interrupt it.]'
-            )
-            exit_code = 130  # SIGINT
-            logger.error(f'Failed to execute command: {command}. Error: {e}')
-
+            logger.warning(f'Bash pexpect.TIMEOUT while executing bash command: {e}')
+            if kill_on_timeout:
+                output, exit_code = self._interrupt_bash(action_timeout=timeout)
+            else:
+                output = self.shell.before or ''
+                exit_code = -1
         finally:
             bash_prompt = self._get_bash_prompt_and_update_pwd()
             if keep_prompt:
                 output += '\r\n' + bash_prompt
-            logger.debug(f'Command output: {output}')
-
         return output, exit_code
 
     async def run_action(self, action) -> Observation:
         action_type = action.action
+        logger.debug(f'Running action:\n{action}')
         observation = await getattr(self, action_type)(action)
+        logger.debug(f'Action output:\n{observation}')
         return observation
 
     async def run(self, action: CmdRunAction) -> CmdOutputObservation:
@@ -284,11 +431,25 @@ class RuntimeClient:
             commands = split_bash_commands(action.command)
             all_output = ''
             for command in commands:
-                output, exit_code = self._execute_bash(
-                    command,
-                    timeout=action.timeout,
-                    keep_prompt=action.keep_prompt,
-                )
+                if command == '':
+                    output, exit_code = self._continue_bash(
+                        timeout=SOFT_TIMEOUT_SECONDS,
+                        keep_prompt=action.keep_prompt,
+                        kill_on_timeout=False,
+                    )
+                elif command.lower() == 'ctrl+c':
+                    output, exit_code = self._interrupt_bash(
+                        action_timeout=None,  # intentionally None
+                    )
+                else:
+                    output, exit_code = self._execute_bash(
+                        command,
+                        timeout=SOFT_TIMEOUT_SECONDS
+                        if not action.blocking
+                        else action.timeout,
+                        keep_prompt=action.keep_prompt,
+                        kill_on_timeout=False if not action.blocking else True,
+                    )
                 if all_output:
                     # previous output already exists with prompt "user@hostname:working_dir #""
                     # we need to add the command to the previous output,
@@ -312,10 +473,9 @@ class RuntimeClient:
             _jupyter_plugin: JupyterPlugin = self.plugins['jupyter']  # type: ignore
             # This is used to make AgentSkills in Jupyter aware of the
             # current working directory in Bash
-            if self.pwd != getattr(self, '_jupyter_pwd', None):
-                logger.debug(
-                    f"{self.pwd} != {getattr(self, '_jupyter_pwd', None)} -> reset Jupyter PWD"
-                )
+            jupyter_pwd = getattr(self, '_jupyter_pwd', None)
+            if self.pwd != jupyter_pwd:
+                logger.debug(f'{self.pwd} != {jupyter_pwd} -> reset Jupyter PWD')
                 reset_jupyter_pwd_code = f'import os; os.chdir("{self.pwd}")'
                 _aux_action = IPythonRunCellAction(code=reset_jupyter_pwd_code)
                 _reset_obs = await _jupyter_plugin.run(_aux_action)
@@ -327,6 +487,7 @@ class RuntimeClient:
             obs: IPythonRunCellObservation = await _jupyter_plugin.run(action)
             obs.content = obs.content.rstrip()
             obs.content += f'\n[Jupyter current working directory: {self.pwd}]'
+            obs.content += f'\n[Jupyter Python interpreter: {_jupyter_plugin.python_interpreter_path}]'
             return obs
         else:
             raise RuntimeError(
@@ -406,7 +567,7 @@ class RuntimeClient:
                     os.chown(filepath, file_stat.st_uid, file_stat.st_gid)
                 else:
                     # set the new file permissions if the file is new
-                    os.chmod(filepath, 0o644)
+                    os.chmod(filepath, 0o664)
                     os.chown(filepath, self.user_id, self.user_id)
 
             except FileNotFoundError:
@@ -478,12 +639,59 @@ if __name__ == '__main__':
 
     app = FastAPI(lifespan=lifespan)
 
+    # TODO below 3 exception handlers were recommended by Sonnet.
+    # Are these something we should keep?
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception):
+        logger.exception('Unhandled exception occurred:')
+        return JSONResponse(
+            status_code=500,
+            content={
+                'message': 'An unexpected error occurred. Please try again later.'
+            },
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+        logger.error(f'HTTP exception occurred: {exc.detail}')
+        return JSONResponse(
+            status_code=exc.status_code, content={'message': exc.detail}
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ):
+        logger.error(f'Validation error occurred: {exc}')
+        return JSONResponse(
+            status_code=422,
+            content={'message': 'Invalid request parameters', 'details': exc.errors()},
+        )
+
     @app.middleware('http')
     async def one_request_at_a_time(request: Request, call_next):
         assert client is not None
         async with client.lock:
             response = await call_next(request)
         return response
+
+    @app.middleware('http')
+    async def authenticate_requests(request: Request, call_next):
+        if request.url.path != '/alive' and request.url.path != '/server_info':
+            try:
+                verify_api_key(request.headers.get('X-Session-API-Key'))
+            except HTTPException as e:
+                return e
+        response = await call_next(request)
+        return response
+
+    @app.get('/server_info')
+    async def get_server_info():
+        assert client is not None
+        current_time = time.time()
+        uptime = current_time - client.start_time
+        idle_time = current_time - client.last_execution_time
+        return {'uptime': uptime, 'idle_time': idle_time}
 
     @app.post('/execute_action')
     async def execute_action(action_request: ActionRequest):
@@ -492,10 +700,13 @@ if __name__ == '__main__':
             action = event_from_dict(action_request.action)
             if not isinstance(action, Action):
                 raise HTTPException(status_code=400, detail='Invalid action type')
+            client.last_execution_time = time.time()
             observation = await client.run_action(action)
             return event_to_dict(observation)
         except Exception as e:
-            logger.error(f'Error processing command: {str(e)}')
+            logger.error(
+                f'Error processing command: {str(e)}', exc_info=True, stack_info=True
+            )
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post('/upload_file')
@@ -515,7 +726,7 @@ if __name__ == '__main__':
             if not os.path.exists(full_dest_path):
                 os.makedirs(full_dest_path, exist_ok=True)
 
-            if recursive:
+            if recursive or file.filename.endswith('.zip'):
                 # For recursive uploads, we expect a zip file
                 if not file.filename.endswith('.zip'):
                     raise HTTPException(
@@ -548,6 +759,40 @@ if __name__ == '__main__':
                 },
                 status_code=200,
             )
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get('/download_files')
+    async def download_file(path: str):
+        logger.info('Downloading files')
+        try:
+            if not os.path.isabs(path):
+                raise HTTPException(
+                    status_code=400, detail='Path must be an absolute path'
+                )
+
+            if not os.path.exists(path):
+                raise HTTPException(status_code=404, detail='File not found')
+
+            with tempfile.TemporaryFile() as temp_zip:
+                with ZipFile(temp_zip, 'w') as zipf:
+                    for root, _, files in os.walk(path):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            zipf.write(
+                                file_path, arcname=os.path.relpath(file_path, path)
+                            )
+                temp_zip.seek(0)  # Rewind the file to the beginning after writing
+                content = temp_zip.read()
+                # Good for small to medium-sized files. For very large files, streaming directly from the
+                # file chunks may be more memory-efficient.
+                zip_stream = io.BytesIO(content)
+                return StreamingResponse(
+                    content=zip_stream,
+                    media_type='application/zip',
+                    headers={'Content-Disposition': f'attachment; filename={path}.zip'},
+                )
 
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -597,62 +842,20 @@ if __name__ == '__main__':
             full_path = os.path.join(client.initial_pwd, path)
 
         if not os.path.exists(full_path):
-            return JSONResponse(
-                content={'error': f'Directory {full_path} does not exist'},
-                status_code=400,
-            )
+            # if user just removed a folder, prevent server error 500 in UI
+            return []
 
         try:
             # Check if the directory exists
             if not os.path.exists(full_path) or not os.path.isdir(full_path):
                 return []
 
-            # Check if .gitignore exists
-            gitignore_path = os.path.join(full_path, '.gitignore')
-            if os.path.exists(gitignore_path):
-                # Use PathSpec to parse .gitignore
-                with open(gitignore_path, 'r') as f:
-                    spec = PathSpec.from_lines(GitWildMatchPattern, f.readlines())
-            else:
-                # Fallback to default exclude list if .gitignore doesn't exist
-                default_exclude = [
-                    '.git',
-                    '.DS_Store',
-                    '.svn',
-                    '.hg',
-                    '.idea',
-                    '.vscode',
-                    '.settings',
-                    '.pytest_cache',
-                    '__pycache__',
-                    'node_modules',
-                    'vendor',
-                    'build',
-                    'dist',
-                    'bin',
-                    'logs',
-                    'log',
-                    'tmp',
-                    'temp',
-                    'coverage',
-                    'venv',
-                    'env',
-                ]
-                spec = PathSpec.from_lines(GitWildMatchPattern, default_exclude)
-
             entries = os.listdir(full_path)
-
-            # Filter entries using PathSpec
-            filtered_entries = [
-                os.path.join(full_path, entry)
-                for entry in entries
-                if not spec.match_file(os.path.relpath(entry, str(full_path)))
-            ]
 
             # Separate directories and files
             directories = []
             files = []
-            for entry in filtered_entries:
+            for entry in entries:
                 # Remove leading slash and any parent directory components
                 entry_relative = entry.lstrip('/').split('/')[-1]
 
@@ -680,6 +883,7 @@ if __name__ == '__main__':
             logger.error(f'Error listing files: {e}', exc_info=True)
             return []
 
+    logger.info('Runtime client initialized.')
+
     logger.info(f'Starting action execution API on port {args.port}')
-    print(f'Starting action execution API on port {args.port}')
     run(app, host='0.0.0.0', port=args.port)

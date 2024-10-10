@@ -1,3 +1,5 @@
+from typing import Callable, Optional
+
 from openhands.core.config import AppConfig
 from openhands.events.action import (
     FileReadAction,
@@ -25,21 +27,28 @@ class E2BRuntime(Runtime):
         sid: str = 'default',
         plugins: list[PluginRequirement] | None = None,
         sandbox: E2BSandbox | None = None,
+        status_message_callback: Optional[Callable] = None,
     ):
-        super().__init__(config, event_stream, sid, plugins)
+        super().__init__(
+            config,
+            event_stream,
+            sid,
+            plugins,
+            status_message_callback=status_message_callback,
+        )
         if sandbox is None:
             self.sandbox = E2BSandbox()
         if not isinstance(self.sandbox, E2BSandbox):
             raise ValueError('E2BRuntime requires an E2BSandbox')
         self.file_store = E2BFileStore(self.sandbox.filesystem)
 
-    async def read(self, action: FileReadAction) -> Observation:
+    def read(self, action: FileReadAction) -> Observation:
         content = self.file_store.read(action.path)
         lines = read_lines(content.split('\n'), action.start, action.end)
         code_view = ''.join(lines)
         return FileReadObservation(code_view, path=action.path)
 
-    async def write(self, action: FileWriteAction) -> Observation:
+    def write(self, action: FileWriteAction) -> Observation:
         if action.start == 0 and action.end == -1:
             self.file_store.write(action.path, action.content)
             return FileWriteObservation(content='', path=action.path)

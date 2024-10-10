@@ -1,10 +1,15 @@
+import asyncio
+import io
 import os
 import re
 import tempfile
 import uuid
 import warnings
+from contextlib import asynccontextmanager
 
 import requests
+from pathspec import PathSpec
+from pathspec.patterns import GitWildMatchPattern
 
 from openhands.security.options import SecurityAnalyzers
 from openhands.server.data_models.feedback import FeedbackDataModel, store_feedback
@@ -14,6 +19,7 @@ with warnings.catch_warnings():
     warnings.simplefilter('ignore')
     import litellm
 
+from dotenv import load_dotenv
 from fastapi import (
     FastAPI,
     HTTPException,
@@ -24,11 +30,12 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-import agenthub  # noqa F401 (we import this to get the agents registered)
+import openhands.agenthub  # noqa F401 (we import this to get the agents registered)
 from openhands.controller.agent import Agent
 from openhands.core.config import LLMConfig, load_app_config
 from openhands.core.logger import openhands_logger as logger
@@ -52,14 +59,24 @@ from openhands.runtime.runtime import Runtime
 from openhands.server.auth import get_sid_from_token, sign_token
 from openhands.server.session import SessionManager
 
+load_dotenv()
+
 config = load_app_config()
 file_store = get_file_store(config.file_store, config.file_store_path)
 session_manager = SessionManager(config, file_store)
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global session_manager
+    async with session_manager:
+        yield
+
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['http://localhost:3001'],
+    allow_origins=['http://localhost:3001', 'http://127.0.0.1:3001'],
     allow_credentials=True,
     allow_methods=['*'],
     allow_headers=['*'],
@@ -170,7 +187,14 @@ async def attach_session(request: Request, call_next):
         response = await call_next(request)
         return response
 
+    # Bypass authentication for OPTIONS requests (preflight)
+    if request.method == 'OPTIONS':
+        response = await call_next(request)
+        return response
+
+    # For all other methods, validate the Authorization header
     if not request.headers.get('Authorization'):
+        logger.warning('Missing Authorization header')
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
             content={'error': 'Missing Authorization header'},
@@ -182,6 +206,7 @@ async def attach_session(request: Request, call_next):
 
     request.state.sid = get_sid_from_token(auth_token, config.jwt_secret)
     if request.state.sid == '':
+        logger.warning('Invalid token')
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
             content={'error': 'Invalid token'},
@@ -255,7 +280,7 @@ async def websocket_endpoint(websocket: WebSocket):
         {"action": "finish", "args": {}}
         ```
     """
-    await websocket.accept()
+    await asyncio.wait_for(websocket.accept(), 10)
 
     if websocket.query_params.get('token'):
         token = websocket.query_params.get('token')
@@ -378,6 +403,14 @@ async def get_security_analyzers():
     return sorted(SecurityAnalyzers.keys())
 
 
+FILES_TO_IGNORE = [
+    '.git/',
+    '.DS_Store',
+    'node_modules/',
+    '__pycache__/',
+]
+
+
 @app.get('/api/list-files')
 async def list_files(request: Request, path: str | None = None):
     """List files in the specified path.
@@ -406,7 +439,30 @@ async def list_files(request: Request, path: str | None = None):
             content={'error': 'Runtime not yet initialized'},
         )
     runtime: Runtime = request.state.session.agent_session.runtime
-    file_list = await runtime.list_files(path)
+    file_list = await asyncio.get_event_loop().run_in_executor(
+        None, runtime.list_files, path
+    )
+    if path:
+        file_list = [os.path.join(path, f) for f in file_list]
+
+    file_list = [f for f in file_list if f not in FILES_TO_IGNORE]
+
+    def filter_for_gitignore(file_list, base_path):
+        gitignore_path = os.path.join(base_path, '.gitignore')
+        try:
+            read_action = FileReadAction(gitignore_path)
+            observation = runtime.run_action(read_action)
+            spec = PathSpec.from_lines(
+                GitWildMatchPattern, observation.content.splitlines()
+            )
+        except Exception as e:
+            print(e)
+            return file_list
+        file_list = [entry for entry in file_list if not spec.match_file(entry)]
+        return file_list
+
+    file_list = filter_for_gitignore(file_list, '')
+
     return file_list
 
 
@@ -432,15 +488,9 @@ async def select_file(file: str, request: Request):
     """
     runtime: Runtime = request.state.session.agent_session.runtime
 
-    # convert file to an absolute path inside the runtime
-    if not os.path.isabs(file):
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={'error': 'File path must be absolute'},
-        )
-
+    file = os.path.join(runtime.config.workspace_mount_path_in_sandbox, file)
     read_action = FileReadAction(file)
-    observation = await runtime.run_action(read_action)
+    observation = await runtime.async_run_action(read_action)
 
     if isinstance(observation, FileReadObservation):
         content = observation.content
@@ -519,7 +569,7 @@ async def upload_file(request: Request, files: list[UploadFile]):
                     tmp_file.flush()
 
                 runtime: Runtime = request.state.session.agent_session.runtime
-                await runtime.copy_to(
+                runtime.copy_to(
                     tmp_file_path, runtime.config.workspace_mount_path_in_sandbox
                 )
             uploaded_files.append(safe_filename)
@@ -676,17 +726,13 @@ async def save_file(request: Request):
         if not file_path or content is None:
             raise HTTPException(status_code=400, detail='Missing filePath or content')
 
-        # Make sure file_path is abs
-        if not os.path.isabs(file_path):
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content={'error': 'File path must be absolute'},
-            )
-
         # Save the file to the agent's runtime file store
         runtime: Runtime = request.state.session.agent_session.runtime
+        file_path = os.path.join(
+            runtime.config.workspace_mount_path_in_sandbox, file_path
+        )
         write_action = FileWriteAction(file_path, content)
-        observation = await runtime.run_action(write_action)
+        observation = await runtime.async_run_action(write_action)
 
         if isinstance(observation, FileWriteObservation):
             return JSONResponse(
@@ -733,4 +779,68 @@ async def security_api(request: Request):
     )
 
 
-app.mount('/', StaticFiles(directory='./frontend/dist', html=True), name='dist')
+@app.get('/api/zip-directory')
+async def zip_current_workspace(request: Request):
+    try:
+        logger.info('Zipping workspace')
+        runtime: Runtime = request.state.session.agent_session.runtime
+
+        path = runtime.config.workspace_mount_path_in_sandbox
+        zip_file_bytes = runtime.copy_from(path)
+        zip_stream = io.BytesIO(zip_file_bytes)  # Wrap to behave like a file stream
+        response = StreamingResponse(
+            zip_stream,
+            media_type='application/x-zip-compressed',
+            headers={'Content-Disposition': 'attachment; filename=workspace.zip'},
+        )
+
+        return response
+    except Exception as e:
+        logger.error(f'Error zipping workspace: {e}', exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail='Failed to zip workspace',
+        )
+
+
+class AuthCode(BaseModel):
+    code: str
+
+
+@app.post('/github/callback')
+def github_callback(auth_code: AuthCode):
+    # Prepare data for the token exchange request
+    data = {
+        'client_id': os.getenv('GITHUB_CLIENT_ID'),
+        'client_secret': os.getenv('GITHUB_CLIENT_SECRET'),
+        'code': auth_code.code,
+    }
+
+    logger.info(f'Exchanging code for token: {data}')
+
+    headers = {'Accept': 'application/json'}
+    response = requests.post(
+        'https://github.com/login/oauth/access_token', data=data, headers=headers
+    )
+
+    if response.status_code != 200:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={'error': 'Failed to exchange code for token'},
+        )
+
+    token_response = response.json()
+
+    if 'access_token' not in token_response:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={'error': 'No access token in response'},
+        )
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={'access_token': token_response['access_token']},
+    )
+
+
+app.mount('/', StaticFiles(directory='./frontend/build', html=True), name='dist')

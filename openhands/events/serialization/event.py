@@ -35,8 +35,8 @@ def event_from_dict(data) -> 'Event':
     for key in UNDERSCORE_KEYS:
         if key in data:
             value = data[key]
-            if key == 'timestamp':
-                value = datetime.fromisoformat(value)
+            if key == 'timestamp' and isinstance(value, datetime):
+                value = value.isoformat()
             if key == 'source':
                 value = EventSource(value)
             setattr(evt, '_' + key, value)
@@ -54,7 +54,8 @@ def event_to_dict(event: 'Event') -> dict:
         if key == 'id' and d.get('id') == -1:
             d.pop('id', None)
         if key == 'timestamp' and 'timestamp' in d:
-            d['timestamp'] = d['timestamp'].isoformat()
+            if isinstance(d['timestamp'], datetime):
+                d['timestamp'] = d['timestamp'].isoformat()
         if key == 'source' and 'source' in d:
             d['source'] = d['source'].value
         props.pop(key, None)
@@ -79,6 +80,13 @@ def event_to_memory(event: 'Event', max_message_chars: int) -> dict:
     d.pop('timestamp', None)
     d.pop('message', None)
     d.pop('images_urls', None)
+
+    # runnable actions have some extra fields used in the BE/FE, which should not be sent to the LLM
+    if 'args' in d:
+        d['args'].pop('blocking', None)
+        d['args'].pop('keep_prompt', None)
+        d['args'].pop('is_confirmed', None)
+
     if 'extras' in d:
         remove_fields(d['extras'], DELETE_FROM_MEMORY_EXTRAS)
     if isinstance(event, Observation) and 'content' in d:
@@ -88,7 +96,7 @@ def event_to_memory(event: 'Event', max_message_chars: int) -> dict:
 
 def truncate_content(content: str, max_chars: int) -> str:
     """Truncate the middle of the observation content if it is too long."""
-    if len(content) <= max_chars:
+    if len(content) <= max_chars or max_chars == -1:
         return content
 
     # truncate the middle and include a message to the LLM about it
